@@ -2,12 +2,14 @@
 
 import math
 import os
+import os.path as osp
 
 import imageio
 import numpy as np
 import tensorflow as tf
 from libero.libero import get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
+from PIL import Image
 
 from experiments.robot.robot_utils import (
     DATE,
@@ -44,15 +46,50 @@ def get_libero_wrist_image(obs):
     return img
 
 
-def save_rollout_video(rollout_images, idx, success, task_description, log_file=None):
-    """Saves an MP4 replay of an episode."""
-    rollout_dir = f"./rollouts/{DATE}"
+def save_rollout_video(
+    rollout_images,
+    rollout_wrist_images,
+    idx,
+    success,
+    task_description,
+    log_dir,
+    log_file=None,
+    save_image=False,
+):
+    """Saves an MP4 replay of an episode, combining main and wrist camera views."""
+    rollout_dir = osp.join(log_dir, f"rollouts/{DATE}")
     os.makedirs(rollout_dir, exist_ok=True)
-    processed_task_description = task_description.lower().replace(" ", "_").replace("\n", "_").replace(".", "_")[:50]
-    mp4_path = f"{rollout_dir}/{DATE_TIME}--openvla_oft--episode={idx}--success={success}--task={processed_task_description}.mp4"
+    processed_task_description = (
+        task_description.lower().replace(" ", "_").replace("\n", "_").replace(".", "_")[:50]
+    )
+    mp4_path = f"{rollout_dir}/{DATE_TIME}--episode={idx}--success={success}--task={processed_task_description}.mp4"
     video_writer = imageio.get_writer(mp4_path, fps=30)
-    for img in rollout_images:
-        video_writer.append_data(img)
+
+    if save_image:
+        dir_path = f"{rollout_dir}/{DATE_TIME}--episode={idx}--success={success}--task={processed_task_description}"
+        os.makedirs(dir_path)
+
+    if rollout_wrist_images:
+        for frame_idx, (main_img, wrist_img) in enumerate(zip(rollout_images, rollout_wrist_images)):
+            if save_image:
+                main_file_name = f"{dir_path}/primary--frame={frame_idx:04d}.bmp"
+                imageio.imwrite(main_file_name, main_img)
+                wrist_file_name = f"{dir_path}/wrist--frame={frame_idx:04d}.bmp"
+                imageio.imwrite(wrist_file_name, wrist_img)
+
+            h1, w1, _ = main_img.shape
+            h2, w2, _ = wrist_img.shape
+            if h1 != h2:
+                target_h = max(h1, h2)
+                main_img = np.array(Image.fromarray(main_img).resize((int(w1 * target_h / h1), target_h)))
+                wrist_img = np.array(Image.fromarray(wrist_img).resize((int(w2 * target_h / h2), target_h)))
+
+            combined_img = np.concatenate((main_img, wrist_img), axis=1)
+            video_writer.append_data(combined_img)
+    else:
+        for img in rollout_images:
+            video_writer.append_data(img)
+
     video_writer.close()
     print(f"Saved rollout MP4 at path {mp4_path}")
     if log_file is not None:

@@ -276,6 +276,9 @@ class PrismaticCausalLMOutputWithPast(ModelOutput):
     # Additions for VLMs
     projector_features: Optional[torch.FloatTensor] = None
 
+    # Additions for extra_attn_weights-based modulation
+    vision_attn_weights: Optional[torch.FloatTensor] = None
+
 
 class PrismaticPreTrainedModel(PreTrainedModel):
     config_class: PretrainedConfig = PrismaticConfig
@@ -349,6 +352,9 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         )
 
         # Instantiate LLM Backbone
+        self.extra_layer_ids = config.extra_attn_weights['extra_layer_ids']
+        config.text_config.force_eager_attn = config.extra_attn_weights['force_eager_attn']
+        config.text_config.extra_layer_ids = config.extra_attn_weights['extra_layer_ids']
         self.language_model = AutoModelForCausalLM.from_config(
             config.text_config, attn_implementation=config._attn_implementation
         )
@@ -458,7 +464,8 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             return torch.cat((projected_patch_embeddings, proprio_features), dim=1)
         return projected_patch_embeddings
 
-    def _build_multimodal_attention(self, input_embeddings, projected_patch_embeddings, attention_mask):
+    def _build_multimodal_attention(self, input_embeddings, projected_patch_embeddings, attention_mask,
+                                    extra_attention_weights=None):
         """Build multimodal embeddings and attention mask"""
         # Update attention mask
         projected_patch_attention_mask = None
@@ -474,6 +481,14 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         multimodal_embeddings = torch.cat(
             [input_embeddings[:, :1, :], projected_patch_embeddings, input_embeddings[:, 1:, :]], dim=1
         )
+        if extra_attention_weights is not None:
+            B, N = extra_attention_weights.shape[0], input_embeddings.shape[1]
+            extra_attention_weights = torch.cat(
+                [extra_attention_weights.new_ones((B, 1, 1)),
+                 extra_attention_weights,
+                 extra_attention_weights.new_ones(B, N-1, 1)],
+                dim=1
+            )
 
         multimodal_attention_mask = None
         if attention_mask is not None:
@@ -481,7 +496,10 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
                 [attention_mask[:, :1], projected_patch_attention_mask, attention_mask[:, 1:]], dim=1
             )
 
-        return multimodal_embeddings, multimodal_attention_mask
+        if extra_attention_weights is None:
+            return multimodal_embeddings, multimodal_attention_mask
+        else:
+            return multimodal_embeddings, multimodal_attention_mask, extra_attention_weights
 
     def _build_multimodal_labels(self, labels, projected_patch_embeddings):
         """Build multimodal labels with IGNORE_INDEX for patch embeddings"""
@@ -515,6 +533,9 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
         noisy_action_projector=None,
         diffusion_timestep_embeddings=None,
         use_film: bool = False,
+        temporal_context: Optional[torch.FloatTensor] = None,
+        vision_attn_weight_generator=None,
+        batch_idx=None,
     ) -> Union[Tuple, PrismaticCausalLMOutputWithPast]:
         """Run a forward pass through the VLM, returning a PrismaticCausalLMOutputWithPast instance."""
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -585,6 +606,15 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             # Get visual features
             projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film)
 
+            # Get vision_attn_weights
+            extra_attn_weights = None
+            vision_attn_weights = None
+            input_action_tokens = None
+            if vision_attn_weight_generator is not None:
+                input_action_tokens, (extra_attn_weights, vision_attn_weights) = vision_attn_weight_generator(
+                    projected_patch_embeddings, temporal_context, language_embeddings, batch_idx=batch_idx
+                )  # vision_attn_weights shape: (B, N, 1)
+
             # Add proprioceptive state if provided
             projected_patch_embeddings = self._process_proprio_features(
                 projected_patch_embeddings, proprio, proprio_projector
@@ -596,6 +626,10 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
                 projected_patch_embeddings = torch.cat(
                     (projected_patch_embeddings, diffusion_timestep_embeddings), dim=1
                 )
+            
+            if extra_attn_weights is not None and projected_patch_embeddings.shape[1] != extra_attn_weights.shape[1]:
+                B, N = extra_attn_weights.shape[0], projected_patch_embeddings.shape[1] - extra_attn_weights.shape[1]
+                extra_attn_weights = torch.cat([extra_attn_weights, extra_attn_weights.new_ones((B, N, 1))], dim=1)
 
             # Process action embeddings
             if noisy_actions is not None:
@@ -615,15 +649,25 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
                     input_embeddings, all_actions_mask, noisy_action_features
                 )
             else:
-                # Replace the embeddings of the action tokens with zeros
-                # (Later on, the positional embeddings will be added to them)
-                all_actions_mask = all_actions_mask.unsqueeze(-1)  # (B, seq_len, 1)
-                input_embeddings = input_embeddings * ~all_actions_mask
+                # Replace the embeddings of the action tokens with zeros or input_action_tokens
+                if input_action_tokens is None:
+                    all_actions_mask = all_actions_mask.unsqueeze(-1)  # (B, seq_len, 1)
+                    input_embeddings = input_embeddings * ~all_actions_mask
+                else:
+                    for i in range(input_embeddings.shape[0]):
+                        mask_ids = all_actions_mask[i].bool()
+                        input_embeddings[i][mask_ids] = input_action_tokens[i]
 
             # Build multimodal embeddings & attention mask
-            multimodal_embeddings, multimodal_attention_mask = self._build_multimodal_attention(
-                input_embeddings, projected_patch_embeddings, attention_mask
-            )
+            if extra_attn_weights is None:
+                multimodal_embeddings, multimodal_attention_mask = self._build_multimodal_attention(
+                    input_embeddings, projected_patch_embeddings, attention_mask
+                )
+            else:
+                (multimodal_embeddings,
+                 multimodal_attention_mask,
+                 extra_attn_weights) = self._build_multimodal_attention(
+                     input_embeddings, projected_patch_embeddings, attention_mask, extra_attn_weights)
 
             # Build labels for multimodal sequence if needed
             multimodal_labels = self._build_multimodal_labels(labels, projected_patch_embeddings)
@@ -640,6 +684,8 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
                 output_attentions=output_attentions,
                 output_hidden_states=output_hidden_states,
                 return_dict=return_dict,
+                extra_attn_weights=extra_attn_weights,
+                extra_layer_ids=self.extra_layer_ids,
             )
 
         # === Otherwise =>> Assume Invalid! ===
@@ -672,6 +718,7 @@ class PrismaticForConditionalGeneration(PrismaticPreTrainedModel):
             hidden_states=language_model_output.hidden_states,
             attentions=language_model_output.attentions,
             projector_features=projected_patch_embeddings,
+            vision_attn_weights=vision_attn_weights,
         )
 
     # === GenerationMixin Methods ===
@@ -872,7 +919,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         curr_noisy_actions = curr_noisy_actions.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM)
 
         # Return final actions
-        return curr_noisy_actions.float().cpu().detach().numpy(), actions_hidden_states
+        return curr_noisy_actions.float().cpu().detach().numpy(), actions_hidden_states, last_hidden_states
 
     def _regression_or_discrete_prediction(
         self,
@@ -884,17 +931,31 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         NUM_PATCHES,
         NUM_PROMPT_TOKENS,
         action_head=None,
+        extra_attn_weights=None,
+        temporal_feature_layer=-1,
+        input_action_tokens=None,
     ):
         """Run L1 regression-based continuous action prediction or discrete action tokens prediction."""
-        # Zero out action token embeddings
-        all_actions_mask = all_actions_mask.unsqueeze(-1)  # (B, seq_len, 1)
-        input_embeddings = input_embeddings * ~all_actions_mask
+        # Replace the embeddings of the action tokens with zeros or input_action_tokens
+        if input_action_tokens is None:
+            all_actions_mask = all_actions_mask.unsqueeze(-1)  # (B, seq_len, 1)
+            input_embeddings = input_embeddings * ~all_actions_mask
+        else:
+            for i in range(input_embeddings.shape[0]):
+                mask_ids = all_actions_mask[i].bool()
+                input_embeddings[i][mask_ids] = input_action_tokens[i]
 
-        # Build multimodal embeddings and attention mask
-        multimodal_embeddings, multimodal_attention_mask = self._build_multimodal_attention(
-            input_embeddings, projected_patch_embeddings, attention_mask
-        )
-
+        # Build multimodal embeddings & attention mask
+        if extra_attn_weights is None:
+            multimodal_embeddings, multimodal_attention_mask = self._build_multimodal_attention(
+                input_embeddings, projected_patch_embeddings, attention_mask
+            )
+        else:
+            (multimodal_embeddings,
+             multimodal_attention_mask,
+             extra_attn_weights) = self._build_multimodal_attention(
+                 input_embeddings, projected_patch_embeddings, attention_mask, extra_attn_weights)
+        
         # Forward pass through language model
         language_model_output = self.language_model(
             input_ids=None,
@@ -903,10 +964,12 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             past_key_values=None,
             inputs_embeds=multimodal_embeddings,
             labels=None,
-            use_cache=None,
+            use_cache=False,  # No cache required
             output_attentions=False,
             output_hidden_states=True,
             return_dict=True,
+            extra_attn_weights=extra_attn_weights,
+            extra_layer_ids=self.extra_layer_ids,
         )
 
         # Extract hidden states for action tokens
@@ -939,7 +1002,15 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             normalized_actions = self.bin_centers[discretized_actions]
             normalized_actions = normalized_actions.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM)
 
-        return normalized_actions, actions_hidden_states
+        # Return the selected hidden states for temporal feature extraction
+        last_hidden_states = language_model_output.hidden_states[temporal_feature_layer]  # (B, seq_len, D)
+        actions_hidden_states = last_hidden_states[
+            :,
+            NUM_PATCHES + NUM_PROMPT_TOKENS : NUM_PATCHES + NUM_PROMPT_TOKENS + ACTION_DIM * NUM_ACTIONS_CHUNK,
+            :,
+        ]  # (B, act_chunk_len, D)
+
+        return normalized_actions, actions_hidden_states, last_hidden_states
 
     def predict_action(
         self,
@@ -950,6 +1021,10 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         action_head=None,
         noisy_action_projector=None,
         use_film: bool = False,
+        temporal_context: Optional[torch.FloatTensor] = None,
+        temporal_feature_layer=-1,
+        vision_attn_weight_generator=None,
+        vision_attn_ratio=None,
         **kwargs: str,
     ) -> np.ndarray:
         """Predict actions from input sequence, with options for different prediction methods.
@@ -962,6 +1037,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             action_head: Optional head for L1 regression or diffusion-based prediction
             noisy_action_projector: Projector for noisy actions in diffusion-based prediction
             use_film: Whether to use FiLM conditioning
+            temporal_context: Temporal context features for conditioning
             **kwargs: Additional arguments including pixel_values and attention_mask
 
         Returns:
@@ -999,8 +1075,20 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             input_embeddings.shape[0], -1, input_embeddings.shape[2]
         )
 
-        # Process vision features
+        # Get visual features
         projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film)
+
+        # Get vision_attn_weights
+        extra_attn_weights = None
+        vision_attn_weights = None
+        input_action_tokens = None
+        if vision_attn_weight_generator is not None:
+            input_action_tokens, (extra_attn_weights, vision_attn_weights) = vision_attn_weight_generator(
+                projected_patch_embeddings,
+                temporal_context,
+                language_embeddings,
+                selected_ratio=vision_attn_ratio,
+            )  # vision_attn_weights shape: (B, N, 1)
 
         # Add proprioceptive features if provided
         use_proprio = proprio_projector is not None and proprio is not None
@@ -1009,6 +1097,10 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             projected_patch_embeddings = self._process_proprio_features(
                 projected_patch_embeddings, proprio, proprio_projector
             )
+
+        if extra_attn_weights is not None and projected_patch_embeddings.shape[1] != extra_attn_weights.shape[1]:
+            B, N = extra_attn_weights.shape[0], projected_patch_embeddings.shape[1] - extra_attn_weights.shape[1]
+            extra_attn_weights = torch.cat([extra_attn_weights, extra_attn_weights.new_ones((B, N, 1))], dim=1)
 
         # Use diffusion if provided, otherwise use regression or discrete prediction
         use_diffusion = noisy_action_projector is not None and hasattr(action_head, "noise_scheduler")
@@ -1027,7 +1119,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             )
 
             # Run diffusion-based prediction
-            normalized_actions, actions_hidden_states = self._run_diffusion_prediction(
+            normalized_actions, actions_hidden_states, last_hidden_states = self._run_diffusion_prediction(
                 input_embeddings,
                 all_actions_mask,
                 noise,
@@ -1041,7 +1133,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             )
         else:
             # Run regression or discrete token-based prediction
-            normalized_actions, actions_hidden_states = self._regression_or_discrete_prediction(
+            normalized_actions, actions_hidden_states, last_hidden_states = self._regression_or_discrete_prediction(
                 input_embeddings,
                 all_actions_mask,
                 projected_patch_embeddings,
@@ -1050,12 +1142,15 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                 NUM_PATCHES,
                 NUM_PROMPT_TOKENS,
                 action_head,
+                extra_attn_weights=extra_attn_weights,
+                temporal_feature_layer=temporal_feature_layer,
+                input_action_tokens=input_action_tokens,
             )
 
         # Unnormalize predicted actions
         actions = self._unnormalize_actions(normalized_actions, unnorm_key)
 
-        return actions, actions_hidden_states
+        return actions, actions_hidden_states, last_hidden_states, input_ids, vision_attn_weights
 
     @staticmethod
     def _check_unnorm_key(norm_stats: Dict[str, Dict[str, Any]], unnorm_key: Optional[str]) -> str:

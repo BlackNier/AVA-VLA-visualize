@@ -3,24 +3,22 @@ requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "openvla-oft"
+name = "ava-vla"
 authors = [
-    {name = "Moo Jin Kim", email="moojink@stanford.edu"},
-    {name = "Chelsea Finn", email="cbfinn@cs.stanford.edu"},
-    {name = "Percy Liang", email="pliang@cs.stanford.edu"},
+    {name = "LiAuto-DSR"},
 ]
-description = "Fine-Tuning Vision-Language-Action Models: Optimizing Speed and Success"
+description = "AVA-VLA: Improving Vision-Language-Action models with Active Visual Attention"
 version = "0.0.1"
 readme = "README.md"
 requires-python = ">=3.8"
-keywords = ["vision-language-actions models", "fine-tuning", "robot learning"]
+keywords = ["vision-language-action models", "active visual attention", "robot learning"]
 license = {file = "LICENSE"}
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Intended Audience :: Education",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.8",
@@ -47,13 +45,13 @@ dependencies = [
     "torch==2.2.0",
     "torchvision==0.17.0",
     "torchaudio==2.2.0",
-    "transformers @ git+https://github.com/moojink/transformers-openvla-oft.git",  # IMPORTANT: Use this fork for bidirectional attn (for parallel decoding)
+    "transformers @ git+https://github.com/LiAuto-DSR/transformers-avavla.git",  # IMPORTANT: Use this fork for AVA-VLA attention support.
     "wandb",
     "tensorflow==2.15.0",
     "tensorflow_datasets==4.9.3",
     "tensorflow_graphics==2021.12.3",
-    "dlimp @ git+https://github.com/moojink/dlimp_openvla",
-    "diffusers",
+    "dlimp @ git+https://github.com/moojink/dlimp_openvla.git",
+    "diffusers==0.32.2",
     "imageio",
     "uvicorn",
     "fastapi",
@@ -74,9 +72,9 @@ sagemaker = [
 ]
 
 [project.urls]
-homepage = "https://github.com/moojink/openvla-oft"
-repository = "https://github.com/moojink/openvla-oft"
-documentation = "https://github.com/moojink/openvla-oft"
+homepage = "https://liauto-dsr.github.io/AVA-VLA-Page/"
+repository = "https://github.com/LiAuto-DSR/AVA-VLA"
+documentation = "https://github.com/LiAuto-DSR/AVA-VLA"
 
 [tool.setuptools.packages.find]
 where = ["."]

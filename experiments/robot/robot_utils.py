@@ -106,7 +106,9 @@ def get_action(
     proprio_projector: Optional[torch.nn.Module] = None,
     noisy_action_projector: Optional[torch.nn.Module] = None,
     use_film: bool = False,
-) -> Union[List[np.ndarray], np.ndarray]:
+    temporal_context: Optional[torch.FloatTensor] = None,
+    vision_attn_weight_generator: Optional[torch.nn.Module] = None,
+) -> tuple[Union[List[np.ndarray], np.ndarray], torch.Tensor, Dict[str, torch.Tensor], torch.Tensor]:
     """
     Query the model to get action predictions.
 
@@ -120,6 +122,7 @@ def get_action(
         proprio_projector: Optional proprioception projector
         noisy_action_projector: Optional noisy action projector for diffusion
         use_film: Whether to use FiLM
+        temporal_context: Optional temporal context tensor
 
     Returns:
         Union[List[np.ndarray], np.ndarray]: Predicted actions
@@ -129,7 +132,7 @@ def get_action(
     """
     with torch.no_grad():
         if cfg.model_family == "openvla":
-            action = get_vla_action(
+            action, last_hidden_states, inputs, actions_hidden_states, vision_attn_weights = get_vla_action(
                 cfg=cfg,
                 vla=model,
                 processor=processor,
@@ -139,11 +142,13 @@ def get_action(
                 proprio_projector=proprio_projector,
                 noisy_action_projector=noisy_action_projector,
                 use_film=use_film,
+                temporal_context=temporal_context,
+                vision_attn_weight_generator=vision_attn_weight_generator,
             )
         else:
             raise ValueError(f"Unsupported model family: {cfg.model_family}")
 
-    return action
+    return action, last_hidden_states, inputs, actions_hidden_states, vision_attn_weights
 
 
 def normalize_gripper_action(action: np.ndarray, binarize: bool = True) -> np.ndarray:

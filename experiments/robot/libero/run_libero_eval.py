@@ -7,19 +7,27 @@ Evaluates a trained policy in a LIBERO simulation benchmark task suite.
 import json
 import logging
 import os
+import os.path as osp
 import sys
+import traceback
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Optional, Union
 
-import draccus
-import numpy as np
-import tqdm
-from libero.libero import benchmark
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+WORK_ROOT = osp.dirname(osp.dirname(osp.dirname(osp.dirname(osp.abspath(__file__)))))
+sys.path.insert(0, WORK_ROOT)
+
+import draccus
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import tqdm
 import wandb
+from libero.libero import benchmark
 
 # Append current directory so that interpreter can find experiments.robot
 sys.path.append("../..")
@@ -36,6 +44,8 @@ from experiments.robot.openvla_utils import (
     get_noisy_action_projector,
     get_processor,
     get_proprio_projector,
+    get_vision_attn_weight_generator,
+    prepare_images_for_vla,
     resize_image_for_policy,
 )
 from experiments.robot.robot_utils import (
@@ -47,6 +57,7 @@ from experiments.robot.robot_utils import (
     normalize_gripper_action,
     set_seed_everywhere,
 )
+from prismatic.util.temporal_context_utils import TemporalFeatureExtractor
 from prismatic.vla.constants import NUM_ACTIONS_CHUNK
 
 
@@ -76,6 +87,29 @@ logging.basicConfig(
     handlers=[logging.StreamHandler()],
 )
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class MultiFrameConfig:
+    # fmt: off
+    temporal_strategy: Optional[str] = None          # Temporal conditioning strategy: ["attn_weight"]
+    temporal_feature_source: Optional[str] = None    # Temporal feature source: ["action"]
+    temporal_feature_layer: int = -2                 # Index of hidden states of LLM. -1: last hidden state with norm, -2: last hidden state without norm, ...
+
+    # Configs of "attn_weight" temporal_strategy
+    # force_eager_attn = True, extra_layer_ids = (layer_i, layer_j, ...):
+    #     The layers in the extra_layer_ids will use LlamaAttention instead of LlamaSdpaAttention,
+    #     and the extra_attn_weights will be used to modulate the softmax operation with the format
+    #     of e^(x_i) * weight_i.
+    attn_weight_force_eager_attn: bool = False
+    attn_weight_extra_layer_ids: Optional[str] = None  # String of indexes. (e.g. "", "(1, 2, 3)", "(i for i in range(0, 32))")
+    attn_weight_head_type: str = "softmaxscore"      # "ste", "gumbel", "softmaxscore", "sigmoidscore"
+    attn_weight_score_config: str = "(1.9, 0.1, 0.0)"  # (pos_score, neg_score, score_bias) for softmaxscore
+    attn_weight_sink_ids: list[int] = None           # Indexes of image patches to force in extra_attn_weights
+    attn_weight_sink_weight: float = 1               # Forced value
+    attn_weight_attn_ratio: Optional[float] = None   # The value to implement mean constraint of vision_attn_weight. (mean = attn_ratio)
+
+    # fmt: on
 
 
 @dataclass
@@ -120,12 +154,16 @@ class GenerateConfig:
     #################################################################################################################
     run_id_note: Optional[str] = None                # Extra note to add to end of run ID for logging
     local_log_dir: str = "./experiments/logs"        # Local directory for eval logs
+    log_camera_wrist: bool = True                     # Whether to log the image of wrist camera
 
     use_wandb: bool = False                          # Whether to also log results in Weights & Biases
     wandb_entity: str = "your-wandb-entity"          # Name of WandB entity
     wandb_project: str = "your-wandb-project"        # Name of WandB project
 
     seed: int = 7                                    # Random Seed (for reproducibility)
+
+    multi_frame: MultiFrameConfig = field(default_factory=MultiFrameConfig)  # Multi-frame processing configuration
+    vis_mask: bool = False                           # Whether to visualize the image mask
 
     # fmt: on
 
@@ -141,6 +179,66 @@ def validate_config(cfg: GenerateConfig) -> None:
 
     # Validate task suite
     assert cfg.task_suite_name in [suite.value for suite in TaskSuite], f"Invalid task suite: {cfg.task_suite_name}"
+
+    assert (
+        (cfg.multi_frame.temporal_strategy and cfg.multi_frame.temporal_feature_source)
+        or (cfg.multi_frame.temporal_strategy is None and cfg.multi_frame.temporal_feature_source is None)
+    )
+
+
+def vis(primary_image, wrist_image, vision_attn_weights, only_primary=False, is_continuous=True):
+    def apply_mask_to_image(image_array, mask_array, min_val=None, max_val=None, is_continuous=True):
+        assert image_array.ndim == 3 and image_array.shape[-1] == 3  # (H, W, C)
+        assert mask_array.ndim == 2  # (h, w)
+
+        min_val = np.min(mask_array) if min_val is None else min_val
+        max_val = np.max(mask_array) if max_val is None else max_val
+        max_val = max_val if max_val > min_val else min_val + 1e-12
+
+        scale_factor_h = image_array.shape[0] // mask_array.shape[0]
+        scale_factor_w = image_array.shape[1] // mask_array.shape[1]
+        mask_resized = np.repeat(np.repeat(mask_array, scale_factor_h, axis=0), scale_factor_w, axis=1)
+
+        result = image_array.copy().astype(np.float32)
+        if not is_continuous:
+            alpha = 0.5
+            mask_color = (0, 0, 255)
+
+            colored_mask = np.zeros_like(image_array)
+            colored_mask[:, :, 0] = mask_color[0]  # R
+            colored_mask[:, :, 1] = mask_color[1]  # G
+            colored_mask[:, :, 2] = mask_color[2]  # B
+
+            mask_3channel = np.stack([mask_resized, mask_resized, mask_resized], axis=2)
+            mask_areas = mask_3channel > 0.5
+            result[mask_areas] = (1 - alpha) * result[mask_areas] + alpha * colored_mask[mask_areas]
+        else:
+            alpha = 0.3
+            cmap = plt.get_cmap("viridis")
+
+            mask_normalized = np.clip((mask_resized - min_val) / (max_val - min_val), 0, 1)
+            heatmap_colors = cmap(mask_normalized)  # (224, 224, 4) RGBA
+            heatmap_rgb = heatmap_colors[:, :, :3]
+            heatmap_rgb = heatmap_rgb * 255
+
+            result = (1 - alpha) * result + alpha * heatmap_rgb
+
+        result = np.clip(result, 0, 255).astype(np.uint8)
+        return result
+
+    num_patch_tokens = vision_attn_weights.shape[1]
+    primary_end_idx = num_patch_tokens if only_primary else num_patch_tokens // 2
+
+    primary_image_mask = vision_attn_weights[:, :primary_end_idx].detach()
+    primary_image_mask = primary_image_mask.reshape(16, 16).to(torch.float32).cpu().numpy()  # bs == 1
+    primary_image = apply_mask_to_image(primary_image, primary_image_mask, is_continuous=is_continuous)
+
+    if not only_primary:
+        wrist_image_mask = vision_attn_weights[:, primary_end_idx:].detach()
+        wrist_image_mask = wrist_image_mask.reshape(16, 16).to(torch.float32).cpu().numpy()
+        wrist_image = apply_mask_to_image(wrist_image, wrist_image_mask, is_continuous=is_continuous)
+
+    return primary_image, wrist_image
 
 
 def initialize_model(cfg: GenerateConfig):
@@ -166,14 +264,20 @@ def initialize_model(cfg: GenerateConfig):
     noisy_action_projector = None
     if cfg.use_diffusion:
         noisy_action_projector = get_noisy_action_projector(cfg, model.llm_dim)
+    
+    vision_attn_weight_generator = None
+    if cfg.multi_frame.temporal_strategy == "attn_weight":
+        vision_attn_weight_generator = get_vision_attn_weight_generator(
+            cfg, model.llm_dim, int(np.sqrt(model.vision_backbone.get_num_patches()))
+        )
 
     # Get OpenVLA processor if needed
     processor = None
     if cfg.model_family == "openvla":
         processor = get_processor(cfg)
         check_unnorm_key(cfg, model)
-
-    return model, action_head, proprio_projector, noisy_action_projector, processor
+    
+    return model, action_head, proprio_projector, noisy_action_projector, vision_attn_weight_generator, processor
 
 
 def check_unnorm_key(cfg: GenerateConfig, model) -> None:
@@ -224,6 +328,33 @@ def log_message(message: str, log_file=None):
         log_file.flush()
 
 
+def close_env(env, log_file=None):
+    """Close simulation environments before Python starts tearing down EGL globals."""
+    if env is None:
+        return
+    try:
+        env.close()
+    except Exception as e:
+        log_message(f"Warning: failed to close LIBERO environment cleanly: {e}", log_file)
+
+
+def log_temporal_config(cfg: GenerateConfig, log_file=None):
+    tc = cfg.multi_frame
+    
+    features = []
+    if tc.temporal_strategy:
+        features.append(f"strategy:{tc.temporal_strategy}")
+    if tc.temporal_feature_source:
+        features.append(f"source:{tc.temporal_feature_source}")
+    
+    if features:
+        config_str = f"Temporal config: {', '.join(features)}"
+    else:
+        config_str = "Temporal config: disabled"
+    
+    log_message(config_str, log_file)
+
+
 def load_initial_states(cfg: GenerateConfig, task_suite, task_id: int, log_file=None):
     """Load initial states for the given task."""
     # Get default initial states
@@ -259,7 +390,7 @@ def prepare_observation(obs, resize_size):
         ),
     }
 
-    return observation, img  # Return both processed observation and original image for replay
+    return observation, img, wrist_img
 
 
 def process_action(action, model_family):
@@ -287,6 +418,8 @@ def run_episode(
     noisy_action_projector=None,
     initial_state=None,
     log_file=None,
+    num_patches: int = 0,
+    vision_attn_weight_generator=None,
 ):
     """Run a single episode in the environment."""
     # Reset environment
@@ -308,10 +441,14 @@ def run_episode(
     # Setup
     t = 0
     replay_images = []
+    replay_wrist_images = []
     max_steps = TASK_MAX_STEPS[cfg.task_suite_name]
 
     # Run episode
     success = False
+    vision_attn_weights = None
+    temporal_context = None
+    temporal_extractor = TemporalFeatureExtractor()
     try:
         while t < max_steps + cfg.num_steps_wait:
             # Do nothing for the first few timesteps to let objects stabilize
@@ -321,13 +458,18 @@ def run_episode(
                 continue
 
             # Prepare observation
-            observation, img = prepare_observation(obs, resize_size)
+            observation, img, wrist_img = prepare_observation(obs, resize_size)
+            # Get the same images as passed to the model if visualizing mask
+            if cfg.vis_mask:
+                img, wrist_img = (np.array(item) for item in prepare_images_for_vla([img, wrist_img], cfg))
             replay_images.append(img)
+            if cfg.log_camera_wrist:
+                replay_wrist_images.append(wrist_img)
 
             # If action queue is empty, requery model
             if len(action_queue) == 0:
                 # Query model to get action
-                actions = get_action(
+                actions, last_hidden_states, inputs, actions_hidden_states, vision_attn_weights = get_action(
                     cfg,
                     model,
                     observation,
@@ -337,8 +479,36 @@ def run_episode(
                     proprio_projector=proprio_projector,
                     noisy_action_projector=noisy_action_projector,
                     use_film=cfg.use_film,
+                    temporal_context=temporal_context,
+                    vision_attn_weight_generator=vision_attn_weight_generator,
                 )
                 action_queue.extend(actions)
+
+                if cfg.multi_frame.temporal_feature_source is not None:
+                    if cfg.multi_frame.temporal_feature_source == "action":
+                        temporal_context = actions_hidden_states
+                    else:
+                        frame_batch = {"input_ids": inputs}
+                        temporal_context = temporal_extractor.extract_temporal_features(
+                            temporal_feature_source=cfg.multi_frame.temporal_feature_source,
+                            last_hidden_states=last_hidden_states,
+                            frame_batch=frame_batch,
+                            vla_model=model,
+                            num_patches=num_patches,
+                        )
+
+            # Reuse the vision_attn_weights for intermediate frames
+            if cfg.vis_mask and vision_attn_weights is not None:
+                primary_image, wrist_image = img, wrist_img
+                primary_image, wrist_image = vis(
+                    primary_image,
+                    wrist_img,
+                    vision_attn_weights,
+                    only_primary=cfg.num_images_in_input == 1,
+                )
+                replay_images[-1] = primary_image
+                if cfg.log_camera_wrist:
+                    replay_wrist_images[-1] = wrist_image
 
             # Get action from queue
             action = action_queue.popleft()
@@ -354,9 +524,10 @@ def run_episode(
             t += 1
 
     except Exception as e:
-        log_message(f"Episode error: {e}", log_file)
+        error_details = traceback.format_exc()
+        log_message(f"Episode error: {e}\n{error_details}", log_file)
 
-    return success, replay_images
+    return success, replay_images, replay_wrist_images
 
 
 def run_task(
@@ -372,6 +543,8 @@ def run_task(
     total_episodes=0,
     total_successes=0,
     log_file=None,
+    num_patches: int = 0,
+    vision_attn_weight_generator=None,
 ):
     """Run evaluation for a single task."""
     # Get task
@@ -385,59 +558,70 @@ def run_task(
 
     # Start episodes
     task_episodes, task_successes = 0, 0
-    for episode_idx in tqdm.tqdm(range(cfg.num_trials_per_task)):
-        log_message(f"\nTask: {task_description}", log_file)
+    try:
+        for episode_idx in tqdm.tqdm(range(cfg.num_trials_per_task)):
+            log_message(f"\nTask: {task_description}", log_file)
 
-        # Handle initial state
-        if cfg.initial_states_path == "DEFAULT":
-            # Use default initial state
-            initial_state = initial_states[episode_idx]
-        else:
-            # Get keys for fetching initial episode state from JSON
-            initial_states_task_key = task_description.replace(" ", "_")
-            episode_key = f"demo_{episode_idx}"
+            # Handle initial state
+            if cfg.initial_states_path == "DEFAULT":
+                # Use default initial state
+                initial_state = initial_states[episode_idx]
+            else:
+                # Get keys for fetching initial episode state from JSON
+                initial_states_task_key = task_description.replace(" ", "_")
+                episode_key = f"demo_{episode_idx}"
 
-            # Skip episode if expert demonstration failed to complete the task
-            if not all_initial_states[initial_states_task_key][episode_key]["success"]:
-                log_message(f"Skipping task {task_id} episode {episode_idx} due to failed expert demo!", log_file)
-                continue
+                # Skip episode if expert demonstration failed to complete the task
+                if not all_initial_states[initial_states_task_key][episode_key]["success"]:
+                    log_message(f"Skipping task {task_id} episode {episode_idx} due to failed expert demo!", log_file)
+                    continue
 
-            # Get initial state
-            initial_state = np.array(all_initial_states[initial_states_task_key][episode_key]["initial_state"])
+                # Get initial state
+                initial_state = np.array(all_initial_states[initial_states_task_key][episode_key]["initial_state"])
 
-        log_message(f"Starting episode {task_episodes + 1}...", log_file)
+            log_message(f"Starting episode {task_episodes + 1}...", log_file)
 
-        # Run episode
-        success, replay_images = run_episode(
-            cfg,
-            env,
-            task_description,
-            model,
-            resize_size,
-            processor,
-            action_head,
-            proprio_projector,
-            noisy_action_projector,
-            initial_state,
-            log_file,
-        )
+            # Run episode
+            success, replay_images, replay_wrist_images = run_episode(
+                cfg,
+                env,
+                task_description,
+                model,
+                resize_size,
+                processor,
+                action_head,
+                proprio_projector,
+                noisy_action_projector,
+                initial_state,
+                log_file,
+                num_patches,
+                vision_attn_weight_generator,
+            )
 
-        # Update counters
-        task_episodes += 1
-        total_episodes += 1
-        if success:
-            task_successes += 1
-            total_successes += 1
+            # Update counters
+            task_episodes += 1
+            total_episodes += 1
+            if success:
+                task_successes += 1
+                total_successes += 1
 
-        # Save replay video
-        save_rollout_video(
-            replay_images, total_episodes, success=success, task_description=task_description, log_file=log_file
-        )
+            # Save replay video
+            save_rollout_video(
+                replay_images,
+                replay_wrist_images,
+                total_episodes,
+                success=success,
+                task_description=task_description,
+                log_dir=cfg.local_log_dir,
+                log_file=log_file,
+            )
 
-        # Log results
-        log_message(f"Success: {success}", log_file)
-        log_message(f"# episodes completed so far: {total_episodes}", log_file)
-        log_message(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)", log_file)
+            # Log results
+            log_message(f"Success: {success}", log_file)
+            log_message(f"# episodes completed so far: {total_episodes}", log_file)
+            log_message(f"# successes: {total_successes} ({total_successes / total_episodes * 100:.1f}%)", log_file)
+    finally:
+        close_env(env, log_file)
 
     # Log task results
     task_success_rate = float(task_successes) / float(task_episodes) if task_episodes > 0 else 0
@@ -468,7 +652,14 @@ def eval_libero(cfg: GenerateConfig) -> float:
     set_seed_everywhere(cfg.seed)
 
     # Initialize model and components
-    model, action_head, proprio_projector, noisy_action_projector, processor = initialize_model(cfg)
+    (
+        model,
+        action_head,
+        proprio_projector,
+        noisy_action_projector,
+        vision_attn_weight_generator,
+        processor,
+    ) = initialize_model(cfg)
 
     # Get expected image dimensions
     resize_size = get_image_resize_size(cfg)
@@ -481,7 +672,20 @@ def eval_libero(cfg: GenerateConfig) -> float:
     task_suite = benchmark_dict[cfg.task_suite_name]()
     num_tasks = task_suite.n_tasks
 
+    log_temporal_config(cfg, log_file)
+
     log_message(f"Task suite: {cfg.task_suite_name}", log_file)
+
+    if hasattr(model, "module"):
+        vision_backbone = model.module.vision_backbone
+    else:
+        vision_backbone = model.vision_backbone
+
+    num_patches = vision_backbone.get_num_patches() * vision_backbone.get_num_images_in_input()
+    if cfg.use_proprio:
+        num_patches += 1
+    if cfg.use_diffusion:
+        num_patches += 1
 
     # Start evaluation
     total_episodes, total_successes = 0, 0
@@ -499,6 +703,8 @@ def eval_libero(cfg: GenerateConfig) -> float:
             total_episodes,
             total_successes,
             log_file,
+            num_patches,
+            vision_attn_weight_generator,
         )
 
     # Calculate final success rate

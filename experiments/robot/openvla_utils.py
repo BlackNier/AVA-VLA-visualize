@@ -27,9 +27,11 @@ from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, Pr
 from prismatic.models.action_heads import DiffusionActionHead, L1RegressionActionHead
 from prismatic.models.film_vit_wrapper import FiLMedPrismaticVisionBackbone
 from prismatic.models.projectors import NoisyActionProjector, ProprioProjector
+from prismatic.models.attn_weight_generator import AttentionWeightGenerator
 from prismatic.vla.constants import (
     ACTION_DIM,
     ACTION_PROPRIO_NORMALIZATION_TYPE,
+    NUM_ACTIONS_CHUNK,
 )
 from prismatic.vla.datasets.rlds.utils.data_utils import NormalizationType
 
@@ -53,7 +55,7 @@ def model_is_on_hf_hub(model_path: str) -> bool:
         return False
 
 
-def update_auto_map(pretrained_checkpoint: str) -> None:
+def update_auto_map(pretrained_checkpoint: str, multi_frame_cfg) -> None:
     """
     Update the AutoMap configuration in the checkpoint config.json file.
 
@@ -84,6 +86,13 @@ def update_auto_map(pretrained_checkpoint: str) -> None:
     config["auto_map"] = {
         "AutoConfig": "configuration_prismatic.OpenVLAConfig",
         "AutoModelForVision2Seq": "modeling_prismatic.OpenVLAForActionPrediction",
+    }
+
+    config["extra_attn_weights"] = {
+        "force_eager_attn": multi_frame_cfg.attn_weight_force_eager_attn,
+        "extra_layer_ids": (
+            list(eval(multi_frame_cfg.attn_weight_extra_layer_ids))
+            if multi_frame_cfg.attn_weight_extra_layer_ids else None),
     }
 
     # Write back the updated config
@@ -275,7 +284,7 @@ def get_vla(cfg: Any) -> torch.nn.Module:
         AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
 
         # Update config.json and sync model files
-        update_auto_map(cfg.pretrained_checkpoint)
+        update_auto_map(cfg.pretrained_checkpoint, cfg.multi_frame)
         check_model_logic_mismatch(cfg.pretrained_checkpoint)
 
     # Load the model
@@ -459,6 +468,28 @@ def get_noisy_action_projector(cfg: Any, llm_dim: int) -> NoisyActionProjector:
     noisy_action_projector.load_state_dict(state_dict)
 
     return noisy_action_projector
+
+
+def get_vision_attn_weight_generator(cfg: Any, llm_dim: int, image_patch_hw: int) -> AttentionWeightGenerator:
+    attn_weight_generator = AttentionWeightGenerator(**{
+            "embed_dim": llm_dim // 4,
+            "image_shape": (image_patch_hw, image_patch_hw, llm_dim),
+            "action_shape": (NUM_ACTIONS_CHUNK, ACTION_DIM, llm_dim),
+            "text_dim": llm_dim,
+            "num_images": cfg.num_images_in_input,
+            "head_type": cfg.multi_frame.attn_weight_head_type,
+            "score_config": cfg.multi_frame.attn_weight_score_config,
+            "sink_ids": cfg.multi_frame.attn_weight_sink_ids,
+            "sink_weight": cfg.multi_frame.attn_weight_sink_weight,
+    }).to(DEVICE)
+    attn_weight_generator = attn_weight_generator.to(torch.bfloat16).to(DEVICE)
+    attn_weight_generator.eval()
+
+    checkpoint_path = find_checkpoint_file(cfg.pretrained_checkpoint, "vision_attn_weight_generator")
+    state_dict = load_component_state_dict(checkpoint_path)
+    attn_weight_generator.load_state_dict(state_dict)
+    
+    return attn_weight_generator
 
 
 def get_action_head(cfg: Any, llm_dim: int) -> Union[L1RegressionActionHead, DiffusionActionHead]:
@@ -693,17 +724,13 @@ def prepare_images_for_vla(images: List[np.ndarray], cfg: Any) -> List[Image.Ima
     processed_images = []
 
     for image in images:
-        # Validate format
         check_image_format(image)
 
-        # Resize if needed
         if image.shape != (OPENVLA_IMAGE_SIZE, OPENVLA_IMAGE_SIZE, 3):
             image = resize_image_for_policy(image, OPENVLA_IMAGE_SIZE)
 
-        # Convert to PIL image
         pil_image = Image.fromarray(image).convert("RGB")
 
-        # Apply center crop if configured
         if cfg.center_crop:
             pil_image = center_crop_image(pil_image)
 
@@ -722,7 +749,15 @@ def get_vla_action(
     proprio_projector: Optional[torch.nn.Module] = None,
     noisy_action_projector: Optional[torch.nn.Module] = None,
     use_film: bool = False,
-) -> List[np.ndarray]:
+    temporal_context: Optional[torch.FloatTensor] = None,
+    vision_attn_weight_generator: Optional[torch.nn.Module] = None,
+) -> tuple[
+    List[np.ndarray],
+    torch.Tensor,
+    torch.Tensor,
+    Optional[torch.Tensor],
+    Optional[torch.Tensor],
+]:
     """
     Generate action predictions with the VLA policy.
 
@@ -736,9 +771,12 @@ def get_vla_action(
         proprio_projector: Optional proprioception projector
         noisy_action_projector: Optional noisy action projector for diffusion
         use_film: Whether to use FiLM
+        temporal_context: Optional temporal context tensor
+        vision_attn_weight_generator: Optional vision attention weight generator
 
     Returns:
-        List[np.ndarray]: Predicted actions
+        Predicted actions, last hidden states, input ids, action hidden states,
+        and vision attention weights.
     """
     with torch.inference_mode():
 
@@ -759,10 +797,13 @@ def get_vla_action(
         # Process primary image
         inputs = processor(prompt, primary_image).to(DEVICE, dtype=torch.bfloat16)
 
+        base_tokenizer = processor.tokenizer
+
         # Process additional wrist images if any
         if all_images:
+            # Use the decoded prompt so wrist inputs match the primary input tokenization.
             all_wrist_inputs = [
-                processor(prompt, image_wrist).to(DEVICE, dtype=torch.bfloat16) for image_wrist in all_images
+                processor(text=base_tokenizer.decode(inputs["input_ids"][0]), images=image_wrist).to(DEVICE, dtype=torch.bfloat16) for image_wrist in all_images
             ]
             # Concatenate all images
             primary_pixel_values = inputs["pixel_values"]
@@ -777,13 +818,20 @@ def get_vla_action(
             obs["state"] = normalize_proprio(proprio, proprio_norm_stats)
             proprio = obs["state"]
 
+        actions_hidden_states = None
+        vision_attn_weights = None
+
         # Generate action
         if action_head is None:
             # Standard VLA output (single-image inputs, discrete actions)
-            action, _ = vla.predict_action(**inputs, unnorm_key=cfg.unnorm_key, do_sample=False)
+            action, _, last_hidden_states, input_ids = vla.predict_action(
+                **inputs,
+                unnorm_key=cfg.unnorm_key,
+                do_sample=False,
+            )
         else:
             # Custom action head for continuous actions
-            action, _ = vla.predict_action(
+            action, actions_hidden_states, last_hidden_states, input_ids, vision_attn_weights = vla.predict_action(
                 **inputs,
                 unnorm_key=cfg.unnorm_key,
                 do_sample=False,
@@ -792,10 +840,13 @@ def get_vla_action(
                 noisy_action_projector=noisy_action_projector,
                 action_head=action_head,
                 use_film=use_film,
+                temporal_context=temporal_context,
+                temporal_feature_layer=cfg.multi_frame.temporal_feature_layer,
+                vision_attn_weight_generator=vision_attn_weight_generator,
+                vision_attn_ratio=cfg.multi_frame.attn_weight_attn_ratio,
             )
 
-    # Return action chunk as list of actions
-    return [action[i] for i in range(len(action))]
+    return [action[i] for i in range(len(action))], last_hidden_states, input_ids, actions_hidden_states, vision_attn_weights
 
 
 def get_action_from_server(

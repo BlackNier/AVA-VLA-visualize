@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from typing import Any, Dict, Optional, Tuple, Union
 
 import numpy as np
@@ -7,6 +8,7 @@ from calvin_agent.models.calvin_base_model import CalvinBaseModel
 from PIL import Image
 
 from prismatic.util.temporal_context_utils import TemporalFeatureExtractor
+from prismatic.attention_viz import AttentionCapture, LAYER_GROUPS
 from prismatic.vla.constants import (
     ACTION_PROPRIO_NORMALIZATION_TYPE,
 )
@@ -195,6 +197,9 @@ class DualSystemCalvinEvaluation(CalvinBaseModel):
         temporal_feature_layer: int = -2,
         vision_attn_weight_generator=None,
         vision_attn_ratio: Optional[float] = None,
+        disable_vision_attn_weights: bool = False,
+        attention_viz: bool = False,
+        attention_layer_group: str = "L0-L31",
     ):
         super().__init__()
 
@@ -208,6 +213,9 @@ class DualSystemCalvinEvaluation(CalvinBaseModel):
         self.center_crop = center_crop
         self.vision_attn_weight_generator = vision_attn_weight_generator
         self.vision_attn_ratio = vision_attn_ratio
+        self.disable_vision_attn_weights = disable_vision_attn_weights
+        self.attention_viz = attention_viz
+        self.attention_layer_group = attention_layer_group
 
         self.temporal_feature_source = temporal_feature_source
         self.temporal_feature_layer = temporal_feature_layer
@@ -268,7 +276,16 @@ class DualSystemCalvinEvaluation(CalvinBaseModel):
         inputs = self._build_inputs(prompt, primary_image, gripper_image)
         proprio_state = self._get_normalized_proprio(obs)
 
-        with torch.no_grad():
+        attention_capture = None
+        if self.attention_viz:
+            if self.attention_layer_group not in LAYER_GROUPS:
+                raise ValueError(
+                    f"Unknown attention layer group {self.attention_layer_group}; choose from {sorted(LAYER_GROUPS)}"
+                )
+            # Capture all layers for compatibility with the base attention-viz patch.
+            attention_capture = AttentionCapture(LAYER_GROUPS[self.attention_layer_group])
+
+        with torch.no_grad(), (attention_capture if attention_capture is not None else nullcontext()):
             pred_outputs = self.OFT.predict_action(
                 **inputs,
                 unnorm_key=self.unnorm_key,
@@ -282,6 +299,8 @@ class DualSystemCalvinEvaluation(CalvinBaseModel):
                 temporal_feature_layer=self.temporal_feature_layer,
                 vision_attn_weight_generator=self.vision_attn_weight_generator,
                 vision_attn_ratio=self.vision_attn_ratio,
+                disable_vision_attn_weights=self.disable_vision_attn_weights,
+                attention_capture=attention_capture,
             )
 
             action, actions_hidden_states, last_hidden_states, input_ids, vision_attn_weights = pred_outputs
@@ -297,4 +316,5 @@ class DualSystemCalvinEvaluation(CalvinBaseModel):
             action = action.detach().float().cpu().numpy()
         action[:, -1] = 1 - action[:, -1]
 
-        return [action[i] for i in range(len(action))], temporal_context, vision_attn_weights
+        attention_snapshot = attention_capture.snapshot() if attention_capture is not None else None
+        return [action[i] for i in range(len(action))], temporal_context, vision_attn_weights, attention_snapshot

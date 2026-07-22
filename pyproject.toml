@@ -53,6 +53,7 @@ dependencies = [
     "dlimp @ git+https://github.com/moojink/dlimp_openvla.git",
     "diffusers==0.32.2",
     "imageio",
+    "imageio-ffmpeg",
     "uvicorn",
     "fastapi",
     "json-numpy",

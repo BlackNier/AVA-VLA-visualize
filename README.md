@@ -115,6 +115,17 @@ python ./experiments/robot/libero/run_libero_eval.py \
 
 Set `--task_suite_name` to `libero_spatial`, `libero_object`, `libero_goal`, or `libero_10` to evaluate a specific suite.
 
+To evaluate only selected tasks within a suite, pass their 0-based task IDs as
+a comma-separated list. Omitting `--task_ids` preserves the default behavior of
+evaluating every task in the suite:
+
+```bash
+python ./experiments/robot/libero/run_libero_eval.py \
+  --pretrained_checkpoint <checkpoint> \
+  --task_suite_name libero_spatial \
+  --task_ids "0,3,7"
+```
+
 ## CALVIN Evaluation
 
 Follow the CALVIN evaluation environment setup from [VLA-Adapter](https://github.com/OpenHelix-Team/VLA-Adapter). Set `CALVIN_ROOT` to your local CALVIN checkout.
@@ -162,6 +173,94 @@ If you find AVA-VLA useful for your work, please cite:
   year={2025}
 }
 ```
+
+## LIBERO Attention Matrix Visualization
+
+The LIBERO evaluator can optionally save every Llama layer's attention matrix
+for each policy query. It stores `A_raw` (the same forward pass with AVA's
+`extra_attn_weights` disabled) and `A_final` (the actual AVA forward pass).
+The capture path currently supports L1 regression inference.
+
+```bash
+python experiments/robot/libero/run_libero_eval.py \
+  --pretrained_checkpoint <checkpoint> \
+  --task_suite_name libero_spatial \
+  --num_trials_per_task 1 \
+  --num_open_loop_steps 1 \
+  --attention_viz True \
+  --attention_viz_dir ./experiments/attention_viz
+```
+
+Render one of the supported layer selections:
+
+```bash
+python experiments/robot/libero/visualize_attention.py \
+  --input_dir ./experiments/attention_viz \
+  --output_dir ./experiments/attention_viz_rendered \
+  --layer_group L30 \
+  --component both \
+  --overlay_alpha 0.30
+```
+
+To additionally encode the rendered frames into MP4 videos, add:
+
+```bash
+  --make_video --video_view primary --video_fps 5
+```
+
+`--video_view` can be `full`, `primary`, `wrist`, or `all`. `primary` and
+`wrist` are alpha-blended overlays on the original camera images; `full` is the
+matrix-only view. Video generation is disabled unless `--make_video` is
+supplied; with `--component both`, raw and final videos are written separately.
+The overlay opacity can be changed with `--overlay_alpha`; values around
+`0.25`–`0.40` usually keep the original image clearly visible.
+
+To evaluate with AVA's visual attention reweighting disabled, while retaining
+the AVA action-token conditioning, add this flag to the LIBERO evaluation:
+
+```bash
+--raw_attention_eval True
+```
+
+This is the raw-attention ablation corresponding to `A_raw`; it does not save
+attention matrices or compute metrics automatically.
+
+For a complete AVA removal ablation on LIBERO, use:
+
+```bash
+python ./experiments/robot/libero/run_libero_eval.py \
+  --pretrained_checkpoint <checkpoint> \
+  --disable_ava_module True
+```
+
+This disables the AVA weight generator and temporal conditioning, so
+`input_action_tokens` and visual attention reweighting are also disabled.
+It is mutually exclusive with `--raw_attention_eval`.
+
+The same flag is supported by the CALVIN evaluator:
+
+```bash
+python ./experiments/robot/calvin/run_calvin_eval.py \
+  --pretrained_checkpoint <checkpoint> \
+  --raw_attention_eval True
+```
+
+For a complete AVA removal ablation on CALVIN, use:
+
+```bash
+python ./experiments/robot/calvin/run_calvin_eval.py \
+  --pretrained_checkpoint <checkpoint> \
+  --disable_ava_module True
+```
+
+This disables the AVA weight generator, `input_action_tokens`, visual
+attention reweighting, and AVA temporal conditioning. It is mutually exclusive
+with `--raw_attention_eval`.
+
+`--layer_group` accepts `L30`, `L28-L31`, `L0-L31`, or `L16-L23`.
+Each `.pt` file contains `raw` and `final` dictionaries for all layers,
+stored as CPU `float16` tensors with shape `[batch, heads, query, key]`, plus
+token-layout metadata and the corresponding primary/wrist input images.
 
 ## Acknowledgements
 

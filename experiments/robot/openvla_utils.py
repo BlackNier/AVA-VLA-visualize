@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import time
+from contextlib import nullcontext
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -28,6 +29,7 @@ from prismatic.models.action_heads import DiffusionActionHead, L1RegressionActio
 from prismatic.models.film_vit_wrapper import FiLMedPrismaticVisionBackbone
 from prismatic.models.projectors import NoisyActionProjector, ProprioProjector
 from prismatic.models.attn_weight_generator import AttentionWeightGenerator
+from prismatic.attention_viz import AttentionCapture, LAYER_GROUPS
 from prismatic.vla.constants import (
     ACTION_DIM,
     ACTION_PROPRIO_NORMALIZATION_TYPE,
@@ -287,9 +289,23 @@ def get_vla(cfg: Any) -> torch.nn.Module:
         update_auto_map(cfg.pretrained_checkpoint, cfg.multi_frame)
         check_model_logic_mismatch(cfg.pretrained_checkpoint)
 
+    # Attention visualization needs every Llama layer to use the eager
+    # implementation. Passing an explicit config also makes this work for
+    # Hugging Face checkpoints whose saved config enables fewer AVA layers.
+    load_config = None
+    if getattr(cfg, "attention_viz", False):
+        load_config = AutoConfig.from_pretrained(cfg.pretrained_checkpoint, trust_remote_code=True)
+        load_config.extra_attn_weights = {
+            "force_eager_attn": True,
+            "extra_layer_ids": list(range(32)),
+        }
+        load_config.text_config.force_eager_attn = True
+        load_config.text_config.extra_layer_ids = list(range(32))
+
     # Load the model
     vla = AutoModelForVision2Seq.from_pretrained(
         cfg.pretrained_checkpoint,
+        config=load_config,
         # attn_implementation="flash_attention_2",
         torch_dtype=torch.bfloat16,
         load_in_8bit=cfg.load_in_8bit,
@@ -751,6 +767,9 @@ def get_vla_action(
     use_film: bool = False,
     temporal_context: Optional[torch.FloatTensor] = None,
     vision_attn_weight_generator: Optional[torch.nn.Module] = None,
+    attention_viz: bool = False,
+    attention_layer_group: str = "L0-L31",
+    disable_vision_attn_weights: bool = False,
 ) -> tuple[
     List[np.ndarray],
     torch.Tensor,
@@ -778,7 +797,15 @@ def get_vla_action(
         Predicted actions, last hidden states, input ids, action hidden states,
         and vision attention weights.
     """
-    with torch.inference_mode():
+    if attention_viz and action_head is None:
+        raise ValueError("attention_viz requires the LIBERO L1 regression action head.")
+
+    if attention_viz and attention_layer_group not in LAYER_GROUPS:
+        raise ValueError(
+            f"Unknown attention layer group {attention_layer_group}; choose from {sorted(LAYER_GROUPS)}"
+        )
+    capture = AttentionCapture(LAYER_GROUPS[attention_layer_group]) if attention_viz else None
+    with torch.inference_mode(), (capture if capture is not None else nullcontext()):
 
         # Collect all input images
         all_images = [obs["full_image"]]
@@ -844,9 +871,22 @@ def get_vla_action(
                 temporal_feature_layer=cfg.multi_frame.temporal_feature_layer,
                 vision_attn_weight_generator=vision_attn_weight_generator,
                 vision_attn_ratio=cfg.multi_frame.attn_weight_attn_ratio,
+                attention_capture=capture,
+                disable_vision_attn_weights=disable_vision_attn_weights,
             )
 
-    return [action[i] for i in range(len(action))], last_hidden_states, input_ids, actions_hidden_states, vision_attn_weights
+    if capture is None:
+        return [action[i] for i in range(len(action))], last_hidden_states, input_ids, actions_hidden_states, vision_attn_weights
+
+    attention_snapshot = capture.snapshot()
+    return (
+        [action[i] for i in range(len(action))],
+        last_hidden_states,
+        input_ids,
+        actions_hidden_states,
+        vision_attn_weights,
+        attention_snapshot,
+    )
 
 
 def get_action_from_server(

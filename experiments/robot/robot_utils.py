@@ -108,6 +108,9 @@ def get_action(
     use_film: bool = False,
     temporal_context: Optional[torch.FloatTensor] = None,
     vision_attn_weight_generator: Optional[torch.nn.Module] = None,
+    attention_viz: bool = False,
+    attention_layer_group: str = "L0-L31",
+    disable_vision_attn_weights: bool = False,
 ) -> tuple[Union[List[np.ndarray], np.ndarray], torch.Tensor, Dict[str, torch.Tensor], torch.Tensor]:
     """
     Query the model to get action predictions.
@@ -132,7 +135,7 @@ def get_action(
     """
     with torch.no_grad():
         if cfg.model_family == "openvla":
-            action, last_hidden_states, inputs, actions_hidden_states, vision_attn_weights = get_vla_action(
+            result = get_vla_action(
                 cfg=cfg,
                 vla=model,
                 processor=processor,
@@ -144,10 +147,19 @@ def get_action(
                 use_film=use_film,
                 temporal_context=temporal_context,
                 vision_attn_weight_generator=vision_attn_weight_generator,
+                attention_viz=attention_viz,
+                attention_layer_group=attention_layer_group,
+                disable_vision_attn_weights=disable_vision_attn_weights,
             )
+            if attention_viz:
+                action, last_hidden_states, inputs, actions_hidden_states, vision_attn_weights, attention_snapshot = result
+            else:
+                action, last_hidden_states, inputs, actions_hidden_states, vision_attn_weights = result
         else:
             raise ValueError(f"Unsupported model family: {cfg.model_family}")
 
+    if attention_viz:
+        return action, last_hidden_states, inputs, actions_hidden_states, vision_attn_weights, attention_snapshot
     return action, last_hidden_states, inputs, actions_hidden_states, vision_attn_weights
 
 

@@ -58,6 +58,7 @@ from experiments.robot.robot_utils import (
     set_seed_everywhere,
 )
 from prismatic.util.temporal_context_utils import TemporalFeatureExtractor
+from prismatic.attention_viz import LAYER_GROUPS, save_attention_snapshot
 from prismatic.vla.constants import NUM_ACTIONS_CHUNK
 
 
@@ -144,6 +145,7 @@ class GenerateConfig:
     # LIBERO environment-specific parameters
     #################################################################################################################
     task_suite_name: str = TaskSuite.LIBERO_SPATIAL  # Task suite
+    task_ids: Optional[str] = None                    # Comma-separated 0-based task IDs; None evaluates all tasks
     num_steps_wait: int = 10                         # Number of steps to wait for objects to stabilize in sim
     num_trials_per_task: int = 50                    # Number of rollouts per task
     initial_states_path: str = "DEFAULT"             # "DEFAULT", or path to initial states JSON file
@@ -164,6 +166,11 @@ class GenerateConfig:
 
     multi_frame: MultiFrameConfig = field(default_factory=MultiFrameConfig)  # Multi-frame processing configuration
     vis_mask: bool = False                           # Whether to visualize the image mask
+    attention_viz: bool = False                      # Save raw/final attention matrices during LIBERO inference
+    attention_viz_dir: str = "./experiments/attention_viz"  # Output directory for attention snapshots
+    attention_layer_group: str = "L0-L31"             # Layers to capture when attention_viz is enabled
+    raw_attention_eval: bool = False                 # Disable AVA visual attention reweighting during evaluation
+    disable_ava_module: bool = False                 # Disable AVA generator and its temporal conditioning
 
     # fmt: on
 
@@ -180,10 +187,58 @@ def validate_config(cfg: GenerateConfig) -> None:
     # Validate task suite
     assert cfg.task_suite_name in [suite.value for suite in TaskSuite], f"Invalid task suite: {cfg.task_suite_name}"
 
+    if cfg.attention_viz:
+        if not cfg.use_l1_regression or cfg.use_diffusion:
+            raise ValueError("attention_viz currently supports LIBERO L1 regression only.")
+        if cfg.attention_layer_group not in LAYER_GROUPS:
+            raise ValueError(
+                f"Unknown attention_layer_group {cfg.attention_layer_group}; choose from {sorted(LAYER_GROUPS)}"
+            )
+        cfg.multi_frame.temporal_strategy = "attn_weight"
+        cfg.multi_frame.temporal_feature_source = "action"
+        cfg.multi_frame.attn_weight_force_eager_attn = True
+        cfg.multi_frame.attn_weight_extra_layer_ids = "(i for i in range(0, 32))"
+        if cfg.num_open_loop_steps != 1:
+            logger.warning("attention_viz saves one matrix per policy query; use --num_open_loop_steps 1 for every step.")
+
+    if cfg.raw_attention_eval:
+        if not cfg.use_l1_regression or cfg.use_diffusion:
+            raise ValueError("raw_attention_eval currently supports LIBERO L1 regression only.")
+        if cfg.attention_viz:
+            raise ValueError("raw_attention_eval and attention_viz cannot be enabled together.")
+        cfg.multi_frame.temporal_strategy = "attn_weight"
+        cfg.multi_frame.temporal_feature_source = "action"
+
+    if cfg.disable_ava_module:
+        if cfg.raw_attention_eval:
+            raise ValueError("raw_attention_eval and disable_ava_module cannot be enabled together.")
+        cfg.multi_frame.temporal_strategy = None
+        cfg.multi_frame.temporal_feature_source = None
+
     assert (
         (cfg.multi_frame.temporal_strategy and cfg.multi_frame.temporal_feature_source)
         or (cfg.multi_frame.temporal_strategy is None and cfg.multi_frame.temporal_feature_source is None)
     )
+
+
+def parse_task_ids(task_ids: Optional[str], num_tasks: int):
+    """Parse and validate the optional comma-separated LIBERO task selection."""
+    if task_ids is None or not str(task_ids).strip():
+        return list(range(num_tasks))
+
+    try:
+        selected_ids = [int(item.strip()) for item in str(task_ids).split(",") if item.strip()]
+    except ValueError as exc:
+        raise ValueError("task_ids must be a comma-separated list of integer task IDs, e.g. '0,3,7'.") from exc
+
+    if not selected_ids:
+        raise ValueError("task_ids must contain at least one task ID.")
+    if len(set(selected_ids)) != len(selected_ids):
+        raise ValueError(f"task_ids contains duplicates: {selected_ids}")
+    invalid_ids = [task_id for task_id in selected_ids if task_id < 0 or task_id >= num_tasks]
+    if invalid_ids:
+        raise ValueError(f"task_ids {invalid_ids} are outside the valid range [0, {num_tasks - 1}].")
+    return selected_ids
 
 
 def vis(primary_image, wrist_image, vision_attn_weights, only_primary=False, is_continuous=True):
@@ -266,7 +321,7 @@ def initialize_model(cfg: GenerateConfig):
         noisy_action_projector = get_noisy_action_projector(cfg, model.llm_dim)
     
     vision_attn_weight_generator = None
-    if cfg.multi_frame.temporal_strategy == "attn_weight":
+    if cfg.multi_frame.temporal_strategy == "attn_weight" and not cfg.disable_ava_module:
         vision_attn_weight_generator = get_vision_attn_weight_generator(
             cfg, model.llm_dim, int(np.sqrt(model.vision_backbone.get_num_patches()))
         )
@@ -420,6 +475,8 @@ def run_episode(
     log_file=None,
     num_patches: int = 0,
     vision_attn_weight_generator=None,
+    task_id: int = 0,
+    episode_idx: int = 0,
 ):
     """Run a single episode in the environment."""
     # Reset environment
@@ -469,19 +526,55 @@ def run_episode(
             # If action queue is empty, requery model
             if len(action_queue) == 0:
                 # Query model to get action
-                actions, last_hidden_states, inputs, actions_hidden_states, vision_attn_weights = get_action(
-                    cfg,
-                    model,
-                    observation,
-                    task_description,
-                    processor=processor,
-                    action_head=action_head,
-                    proprio_projector=proprio_projector,
-                    noisy_action_projector=noisy_action_projector,
-                    use_film=cfg.use_film,
-                    temporal_context=temporal_context,
-                    vision_attn_weight_generator=vision_attn_weight_generator,
-                )
+                if cfg.attention_viz:
+                    (actions, last_hidden_states, inputs, actions_hidden_states, vision_attn_weights,
+                     attention_snapshot) = get_action(
+                        cfg,
+                        model,
+                        observation,
+                        task_description,
+                        processor=processor,
+                        action_head=action_head,
+                        proprio_projector=proprio_projector,
+                        noisy_action_projector=noisy_action_projector,
+                        use_film=cfg.use_film,
+                        temporal_context=temporal_context,
+                        vision_attn_weight_generator=vision_attn_weight_generator,
+                        disable_vision_attn_weights=cfg.raw_attention_eval,
+                        attention_viz=True,
+                        attention_layer_group=cfg.attention_layer_group,
+                    )
+                    model_images = prepare_images_for_vla(
+                        [img, wrist_img] if cfg.num_images_in_input > 1 else [img], cfg
+                    )
+                    save_attention_snapshot(
+                        attention_snapshot,
+                        Path(cfg.attention_viz_dir) / f"task_{task_id:03d}" / f"episode_{episode_idx:03d}",
+                        f"step_{t:04d}",
+                        primary_image=model_images[0],
+                        wrist_image=model_images[1] if len(model_images) > 1 else None,
+                        metadata={
+                            "task_id": task_id,
+                            "episode_idx": episode_idx,
+                            "env_step": t,
+                            "task_description": task_description,
+                        },
+                    )
+                else:
+                    actions, last_hidden_states, inputs, actions_hidden_states, vision_attn_weights = get_action(
+                        cfg,
+                        model,
+                        observation,
+                        task_description,
+                        processor=processor,
+                        action_head=action_head,
+                        proprio_projector=proprio_projector,
+                        noisy_action_projector=noisy_action_projector,
+                        use_film=cfg.use_film,
+                        temporal_context=temporal_context,
+                        vision_attn_weight_generator=vision_attn_weight_generator,
+                        disable_vision_attn_weights=cfg.raw_attention_eval,
+                    )
                 action_queue.extend(actions)
 
                 if cfg.multi_frame.temporal_feature_source is not None:
@@ -596,6 +689,8 @@ def run_task(
                 log_file,
                 num_patches,
                 vision_attn_weight_generator,
+                task_id=task_id,
+                episode_idx=episode_idx,
             )
 
             # Update counters
@@ -671,10 +766,12 @@ def eval_libero(cfg: GenerateConfig) -> float:
     benchmark_dict = benchmark.get_benchmark_dict()
     task_suite = benchmark_dict[cfg.task_suite_name]()
     num_tasks = task_suite.n_tasks
+    selected_task_ids = parse_task_ids(cfg.task_ids, num_tasks)
 
     log_temporal_config(cfg, log_file)
 
     log_message(f"Task suite: {cfg.task_suite_name}", log_file)
+    log_message(f"Evaluating task IDs: {selected_task_ids}", log_file)
 
     if hasattr(model, "module"):
         vision_backbone = model.module.vision_backbone
@@ -689,7 +786,7 @@ def eval_libero(cfg: GenerateConfig) -> float:
 
     # Start evaluation
     total_episodes, total_successes = 0, 0
-    for task_id in tqdm.tqdm(range(num_tasks)):
+    for task_id in tqdm.tqdm(selected_task_ids):
         total_episodes, total_successes = run_task(
             cfg,
             task_suite,

@@ -5,6 +5,7 @@ import json
 import os
 import time
 from collections import Counter
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
@@ -37,6 +38,7 @@ from experiments.robot.calvin.vla_evaluation import (
     DualSystemCalvinEvaluation,
     center_crop_image,
     check_image_format,
+    prepare_policy_image,
 )
 
 from experiments.robot.openvla_utils import (
@@ -50,6 +52,7 @@ from experiments.robot.openvla_utils import (
 from experiments.robot.robot_utils import (
     get_model,
 )
+from prismatic.attention_viz import LAYER_GROUPS, save_attention_snapshot
 
 os.environ["FFMPEG_BINARY"] = "auto-detect"
 CALVIN_ROOT = os.environ["CALVIN_ROOT"]
@@ -115,6 +118,8 @@ class GenerateConfig:
     # CALVIN
     #################################################################################################################
     enrich_lang: bool = False
+    single_task: Optional[str] = None                # Evaluate one task once instead of 1000 five-task sequences
+    task_sequence: Optional[str] = None              # Comma-separated five-task CALVIN sequence
 
     #################################################################################################################
     # Utils
@@ -126,6 +131,11 @@ class GenerateConfig:
     # Temporal configs (optional)
     multi_frame: MultiFrameConfig = field(default_factory=MultiFrameConfig)
     vis_mask: bool = False
+    attention_viz: bool = False                      # Save raw/final attention matrices during CALVIN inference
+    attention_viz_dir: str = "./experiments/attention_viz_calvin"
+    attention_layer_group: str = "L0-L31"
+    raw_attention_eval: bool = False                 # Disable AVA visual attention reweighting during evaluation
+    disable_ava_module: bool = False                 # Disable AVA generator and its temporal conditioning
 
     save_version: str = "Pro"                        # version of exps
 
@@ -229,7 +239,35 @@ def evaluate_policy(
 
     val_annotations = load_validation_annotations(conf_dir, enrich_lang)
     eval_dir = get_log_dir(eval_dir)
-    eval_sequences = get_process_sequences(num_sequences, num_procs, procs_id)
+    if cfg.single_task is not None and cfg.task_sequence is not None:
+        raise ValueError("single_task and task_sequence are mutually exclusive.")
+
+    if cfg.task_sequence is not None:
+        selected_tasks = tuple(task.strip() for task in cfg.task_sequence.split(",") if task.strip())
+        if len(selected_tasks) != 5:
+            raise ValueError("task_sequence must contain exactly five comma-separated task names.")
+        unknown_tasks = [task for task in selected_tasks if task not in val_annotations]
+        if unknown_tasks:
+            raise ValueError(f"Unknown task_sequence entries: {unknown_tasks}")
+        if num_procs != 1:
+            raise ValueError("task_sequence evaluation must run with one process; launch CALVIN on one GPU/process.")
+        initial_state, _ = get_sequences(1)[0]
+        eval_sequences = [(initial_state, selected_tasks)]
+        eval_num_sequences = 1
+    elif cfg.single_task is not None:
+        if cfg.single_task not in val_annotations:
+            available_tasks = sorted(val_annotations.keys())
+            raise ValueError(
+                f"Unknown single_task {cfg.single_task!r}; available tasks include {available_tasks[:10]}"
+            )
+        if num_procs != 1:
+            raise ValueError("single_task evaluation must run with one process; launch CALVIN on one GPU/process.")
+        initial_state, _ = get_sequences(1)[0]
+        eval_sequences = [(initial_state, (cfg.single_task,))]
+        eval_num_sequences = 1
+    else:
+        eval_sequences = get_process_sequences(num_sequences, num_procs, procs_id)
+        eval_num_sequences = num_sequences
 
     results = []
     if not debug:
@@ -253,10 +291,11 @@ def evaluate_policy(
         results.append(result)
         if not debug:
             success_list = count_success(results)
-            append_success_rates(eval_sr_path, sequence_i, num_sequences, success_list)
+            append_success_rates(eval_sr_path, sequence_i, eval_num_sequences, success_list)
             sequence_i += 1
             eval_sequences.set_description(
-                " ".join([f"{i + 1}/5 : {v * 100:.1f}% |" for i, v in enumerate(success_list)]) + "|"
+                " ".join([f"{i + 1}/{len(eval_sequence)} : {v * 100:.1f}% |" for i, v in enumerate(success_list)])
+                + "|"
             )
         else:
             sequence_i += 1
@@ -504,8 +543,31 @@ def single_inference_test(
     subtask_i,
 ):
     temporal_context = None
-    for _ in range(MAX_ROLLOUT_STEPS // OPEN_LOOP_STEPS):
-        action_buffers, temporal_context, vision_attn_weights = model.step(obs, lang_annotation, temporal_context)
+    for query_idx in range(MAX_ROLLOUT_STEPS // OPEN_LOOP_STEPS):
+        action_buffers, temporal_context, vision_attn_weights, attention_snapshot = model.step(
+            obs, lang_annotation, temporal_context
+        )
+
+        if cfg.attention_viz:
+            primary_image = prepare_policy_image(obs["rgb_obs"]["rgb_static"], cfg.center_crop)
+            wrist_image = prepare_policy_image(obs["rgb_obs"]["rgb_gripper"], cfg.center_crop)
+            save_attention_snapshot(
+                attention_snapshot,
+                Path(cfg.attention_viz_dir)
+                / f"sequence_{sequence_i:04d}"
+                / f"subtask_{subtask_i:02d}",
+                f"step_{query_idx:04d}",
+                primary_image=primary_image,
+                wrist_image=wrist_image,
+                metadata={
+                    "sequence_i": sequence_i,
+                    "subtask_i": subtask_i,
+                    "subtask": subtask,
+                    "query_idx": query_idx,
+                    "instruction": lang_annotation,
+                    "open_loop_steps": len(action_buffers),
+                },
+            )
         for action in action_buffers:
             action = process_action(action, "openvla")
             obs, _reward, _done, current_info = env.step(action.tolist())
@@ -569,6 +631,32 @@ def validate_config(cfg: GenerateConfig) -> None:
 
     assert not (cfg.load_in_8bit and cfg.load_in_4bit), "Cannot use both 8-bit and 4-bit quantization!"
 
+    if cfg.raw_attention_eval:
+        if not cfg.use_l1_regression or cfg.use_diffusion:
+            raise ValueError("raw_attention_eval currently supports CALVIN L1 regression only.")
+        cfg.multi_frame.temporal_strategy = "attn_weight"
+        cfg.multi_frame.temporal_feature_source = "action"
+
+    if cfg.attention_viz:
+        if not cfg.use_l1_regression or cfg.use_diffusion:
+            raise ValueError("attention_viz currently supports CALVIN L1 regression only.")
+        if cfg.raw_attention_eval:
+            raise ValueError("raw_attention_eval and attention_viz cannot be enabled together.")
+        if cfg.attention_layer_group not in LAYER_GROUPS:
+            raise ValueError(
+                f"Unknown attention_layer_group {cfg.attention_layer_group}; choose from {sorted(LAYER_GROUPS)}"
+            )
+        cfg.multi_frame.temporal_strategy = "attn_weight"
+        cfg.multi_frame.temporal_feature_source = "action"
+        cfg.multi_frame.attn_weight_force_eager_attn = True
+        cfg.multi_frame.attn_weight_extra_layer_ids = "(i for i in range(0, 32))"
+
+    if cfg.disable_ava_module:
+        if cfg.raw_attention_eval:
+            raise ValueError("raw_attention_eval and disable_ava_module cannot be enabled together.")
+        cfg.multi_frame.temporal_strategy = None
+        cfg.multi_frame.temporal_feature_source = None
+
 
 def initialize_model(cfg: GenerateConfig):
     """Initialize model and associated components."""
@@ -596,7 +684,7 @@ def initialize_model(cfg: GenerateConfig):
         noisy_action_projector = get_noisy_action_projector(cfg, model.llm_dim)
 
     vision_attn_weight_generator = None
-    if cfg.multi_frame.temporal_strategy == "attn_weight":
+    if cfg.multi_frame.temporal_strategy == "attn_weight" and not cfg.disable_ava_module:
         vision_attn_weight_generator = get_vision_attn_weight_generator(
             cfg, model.llm_dim, int(np.sqrt(model.vision_backbone.get_num_patches()))
         )
@@ -653,6 +741,9 @@ def create_calvin_evaluator(
         temporal_feature_layer=cfg.multi_frame.temporal_feature_layer,
         vision_attn_weight_generator=vision_attn_weight_generator,
         vision_attn_ratio=cfg.multi_frame.attn_weight_attn_ratio,
+        disable_vision_attn_weights=cfg.raw_attention_eval,
+        attention_viz=cfg.attention_viz,
+        attention_layer_group=cfg.attention_layer_group,
     )
 
 

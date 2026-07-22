@@ -934,6 +934,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         extra_attn_weights=None,
         temporal_feature_layer=-1,
         input_action_tokens=None,
+        attention_capture=None,
     ):
         """Run L1 regression-based continuous action prediction or discrete action tokens prediction."""
         # Replace the embeddings of the action tokens with zeros or input_action_tokens
@@ -965,7 +966,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             inputs_embeds=multimodal_embeddings,
             labels=None,
             use_cache=False,  # No cache required
-            output_attentions=False,
+            output_attentions=attention_capture is not None,
             output_hidden_states=True,
             return_dict=True,
             extra_attn_weights=extra_attn_weights,
@@ -1025,6 +1026,8 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         temporal_feature_layer=-1,
         vision_attn_weight_generator=None,
         vision_attn_ratio=None,
+        attention_capture=None,
+        disable_vision_attn_weights=False,
         **kwargs: str,
     ) -> np.ndarray:
         """Predict actions from input sequence, with options for different prediction methods.
@@ -1078,6 +1081,19 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         # Get visual features
         projected_patch_embeddings = self._process_vision_features(pixel_values, language_embeddings, use_film)
 
+        if attention_capture is not None:
+            num_visual_tokens = int(projected_patch_embeddings.shape[1])
+            num_images = int(self.vision_backbone.get_num_images_in_input())
+            patches_per_image = num_visual_tokens // num_images
+            patch_grid = int(round(self.vision_backbone.get_num_patches() ** 0.5))
+            attention_capture.update_layout(
+                visual_token_start=1,
+                visual_token_count=num_visual_tokens,
+                num_images=num_images,
+                patches_per_image=patches_per_image,
+                patch_grid=patch_grid,
+            )
+
         # Get vision_attn_weights
         extra_attn_weights = None
         vision_attn_weights = None
@@ -1089,6 +1105,11 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                 language_embeddings,
                 selected_ratio=vision_attn_ratio,
             )  # vision_attn_weights shape: (B, N, 1)
+
+            if disable_vision_attn_weights:
+                # Keep AVA's action-token conditioning, but run the LLM with
+                # its unmodulated/raw self-attention probabilities.
+                extra_attn_weights = None
 
         # Add proprioceptive features if provided
         use_proprio = proprio_projector is not None and proprio is not None
@@ -1105,12 +1126,21 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         # Use diffusion if provided, otherwise use regression or discrete prediction
         use_diffusion = noisy_action_projector is not None and hasattr(action_head, "noise_scheduler")
 
+        if attention_capture is not None and use_diffusion:
+            raise ValueError("Attention visualization currently supports LIBERO L1 regression only.")
+
         # Calculate number of patches (including proprio token and/or diffusion timestep embedding if present)
         NUM_PATCHES = self.vision_backbone.get_num_patches() * self.vision_backbone.get_num_images_in_input()
         if use_proprio:
             NUM_PATCHES += 1
         if use_diffusion:
             NUM_PATCHES += 1
+
+        if attention_capture is not None:
+            attention_capture.update_layout(
+                action_token_start=int(NUM_PATCHES + NUM_PROMPT_TOKENS),
+                action_token_count=int(ACTION_DIM * NUM_ACTIONS_CHUNK),
+            )
 
         if use_diffusion:
             # Sample random noise with shape equal to output action, used as the starting state for reverse diffusion
@@ -1145,6 +1175,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                 extra_attn_weights=extra_attn_weights,
                 temporal_feature_layer=temporal_feature_layer,
                 input_action_tokens=input_action_tokens,
+                attention_capture=attention_capture,
             )
 
         # Unnormalize predicted actions
